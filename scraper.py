@@ -16,7 +16,18 @@ load_dotenv()
 
 app = Flask(__name__)
 # Enable CORS for all routes
-CORS(app, resources={r"/api/*": {"origins": "https://3.110.189.97"}})
+# CORS(app, resources={r"/api/*": {"origins": "https://3.110.189.97"}})
+CORS(
+    app, 
+    resources={r"/api/*": {
+        "origins": "*",  # Allow all origins for testing
+        "methods": ["GET", "POST", "OPTIONS"],  # Include OPTIONS for preflight
+        "allow_headers": ["Content-Type", "Authorization", "X-Requested-With"],
+        "expose_headers": ["Content-Length", "X-Request-Status"],
+        "supports_credentials": False,
+        "max_age": 3600
+    }}
+)
 
 # Initialize Pinecone client with your API key
 pc = Pinecone(api_key= os.getenv("PINECONE_KEY", "" ))
@@ -390,4 +401,4 @@ def get_stats():
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
-    app.run(debug=True, host='0.0.0.0', port=int(os.getenv("PORT", 3001)))
+    app.run(debug=True, host='0.0.0.0', port=int(os.getenv("PORT", 8080)))
