@@ -16,7 +16,7 @@ load_dotenv()
 
 app = Flask(__name__)
 # Enable CORS for all routes
-CORS(app)
+CORS(app, resources={r"/api/*": {"origins": "https://3.110.189.97"}})
 
 # Initialize Pinecone client with your API key
 pc = Pinecone(api_key= os.getenv("PINECONE_KEY", "" ))
