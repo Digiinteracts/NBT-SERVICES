@@ -16,7 +16,6 @@ load_dotenv()
 
 app = Flask(__name__)
 # Enable CORS for all routes
-# CORS(app, resources={r"/api/*": {"origins": "https://3.110.189.97"}})
 CORS(
     app, 
     resources={r"/api/*": {
@@ -36,15 +35,17 @@ pc = Pinecone(api_key= os.getenv("PINECONE_KEY", "" ))
 INDEX_NAME = "web-scraper-index"
 DIMENSION = 512  # Dimension of our vector embeddings
 
-# Global variables for scraping status
+# Global variables for scraping status - separate current session from cumulative data
 scraping_status = {
     "is_scraping": False,
     "total_pages": 0,
     "pages_scraped": 0,
-    "urls_found": set(),
+    "current_session_urls": set(),  # URLs for current session only
+    "urls_found": set(),  # Cumulative URLs found across all sessions
     "vectors_processed": 0,
     "current_url": "",
-    "error": None
+    "error": None,
+    "session_id": None  # Track current session
 }
 
 # Check if index exists, if not create it (with a free tier compatible configuration)
@@ -79,23 +80,32 @@ except Exception as e:
     in_memory_vectors = []
     use_pinecone = False
 
-def generate_simple_embedding(text, dimension=512):
+def generate_better_embedding(text, dimension=512):
     """
-    Generate a simple deterministic embedding vector for text.
-    This is a placeholder - in production, use a proper embedding model.
+    Generate a better deterministic embedding vector for text.
+    This is still a placeholder but with better distribution characteristics.
+    In production, use a proper machine learning embedding model.
     """
-    # Create a hash of the text
-    text_hash = hashlib.md5(text.encode()).hexdigest()
+    if not text:
+        return [0.0] * dimension
     
-    # Convert the hash to a list of numbers
-    hash_values = []
-    for i in range(0, min(len(text_hash), dimension // 8)):
-        hash_values.append(int(text_hash[i:i+2], 16) / 255.0)
+    # Create a more distributed hash using multiple algorithms
+    hash1 = hashlib.md5(text.encode()).digest()
+    hash2 = hashlib.sha256(text.encode()).digest()
+    hash3 = hashlib.sha1(text.encode()).digest()
     
-    # Pad the vector to the required dimension
-    embedding = hash_values + [0.0] * (dimension - len(hash_values))
+    # Combine hash bytes
+    combined_hash = hash1 + hash2 + hash3
     
-    # Normalize the vector
+    # Generate more values with better distribution
+    embedding = []
+    for i in range(dimension):
+        # Use different parts of the hash for each dimension
+        idx = i % len(combined_hash)
+        value = (combined_hash[idx] / 255.0) * 2 - 1  # Range between -1 and 1
+        embedding.append(value)
+    
+    # Normalize the vector to unit length
     magnitude = sum(x**2 for x in embedding) ** 0.5
     if magnitude > 0:
         embedding = [x / magnitude for x in embedding]
@@ -104,7 +114,7 @@ def generate_simple_embedding(text, dimension=512):
 
 def is_valid_link(link, base_domain):
     """Check if a link is valid for crawling"""
-    if not link or link.startswith("mailto:") or link.startswith("javascript:"):
+    if not link or link.startswith("mailto:") or link.startswith("javascript:") or link.startswith("#"):
         return False
     
     parsed = urlparse(link)
@@ -113,9 +123,17 @@ def is_valid_link(link, base_domain):
     # Check if the link is in the same domain or subdomain
     return parsed.netloc == "" or parsed.netloc == base_parsed.netloc or parsed.netloc.endswith(f".{base_parsed.netloc}")
 
-def batch_upsert_vectors(vectors):
+def batch_upsert_vectors(vectors, session_id):
     """Batch upsert vectors to Pinecone or in-memory storage"""
-    if use_pinecone and vectors:
+    if not vectors:
+        return
+        
+    # Check if the session is still active
+    if session_id != scraping_status["session_id"]:
+        print(f"Session {session_id} is no longer active. Skipping upsert.")
+        return
+        
+    if use_pinecone:
         try:
             # Upsert in batches
             index.upsert(vectors=vectors)
@@ -128,13 +146,23 @@ def batch_upsert_vectors(vectors):
         in_memory_vectors.extend(vectors)
         scraping_status["vectors_processed"] += len(vectors)
 
-def scrape_page(url, base_url, visited, page_limit):
+def scrape_page(url, base_url, visited, page_limit, session_id):
     """Scrape a page and follow links up to the page limit"""
-    if url in visited or len(visited) >= page_limit or not scraping_status["is_scraping"]:
+    # Skip if already visited in this session, reached limit, or session stopped
+    if url in visited or len(visited) >= page_limit or scraping_status["session_id"] != session_id:
+        return
+    
+    # Skip URLs that have already been processed in this session
+    if url in scraping_status["current_session_urls"]:
+        return
+        
+    # Check if the scraping has been cancelled
+    if not scraping_status["is_scraping"]:
         return
     
     print(f"📄 Scraping: {url} ({len(visited) + 1}/{page_limit})")
     visited.add(url)
+    scraping_status["current_session_urls"].add(url)
     scraping_status["urls_found"].add(url)
     scraping_status["current_url"] = url
     scraping_status["pages_scraped"] = len(visited)
@@ -161,14 +189,15 @@ def scrape_page(url, base_url, visited, page_limit):
                 if text and len(text) > 10:  # Only store meaningful content
                     try:
                         # Generate a vector embedding for the text
-                        embedding = generate_simple_embedding(text)
+                        embedding = generate_better_embedding(text)
                         
                         # Prepare vector for batch insertion
-                        record_id = str(uuid.uuid4())
+                        record_id = f"{session_id}_{str(uuid.uuid4())}"
                         metadata = {
                             "source_url": url,
                             "tag": el.name,
-                            "text": text
+                            "text": text,
+                            "session_id": session_id
                         }
                         
                         vector = {
@@ -181,7 +210,7 @@ def scrape_page(url, base_url, visited, page_limit):
                         
                         # If batch reaches size limit, upsert
                         if len(vectors_batch) >= 100:
-                            batch_upsert_vectors(vectors_batch)
+                            batch_upsert_vectors(vectors_batch, session_id)
                             vectors_batch = []
                     
                     except Exception as e:
@@ -189,49 +218,47 @@ def scrape_page(url, base_url, visited, page_limit):
             
             # Upsert any remaining vectors
             if vectors_batch:
-                batch_upsert_vectors(vectors_batch)
+                batch_upsert_vectors(vectors_batch, session_id)
         
         # If we haven't reached the page limit, extract and follow links
-        if len(visited) < page_limit and scraping_status["is_scraping"]:
+        if len(visited) < page_limit and scraping_status["is_scraping"] and scraping_status["session_id"] == session_id:
             links = soup.find_all("a", href=True)
             for link in links:
                 href = link["href"]
                 if is_valid_link(href, base_url):
                     full_url = urljoin(url, href)
                     # Only scrape each URL once
-                    if full_url not in visited:
-                        scrape_page(full_url, base_url, visited, page_limit)
+                    if full_url not in visited and full_url not in scraping_status["current_session_urls"]:
+                        scrape_page(full_url, base_url, visited, page_limit, session_id)
                     
-                    # Stop if we've reached the limit
-                    if len(visited) >= page_limit or not scraping_status["is_scraping"]:
+                    # Stop if we've reached the limit or session is no longer active
+                    if len(visited) >= page_limit or not scraping_status["is_scraping"] or scraping_status["session_id"] != session_id:
                         break
     
     except Exception as e:
         print(f"⚠️ Error scraping {url}: {e}")
 
-def scrape_website_async(start_url, page_limit):
+def scrape_website_async(start_url, page_limit, session_id):
     """Run the scraping process in a separate thread"""
     try:
-        # Reset scraping status
-        scraping_status["is_scraping"] = True
-        scraping_status["total_pages"] = page_limit
-        scraping_status["pages_scraped"] = 0
-        scraping_status["urls_found"] = set()
-        scraping_status["vectors_processed"] = 0
-        scraping_status["current_url"] = start_url
-        scraping_status["error"] = None
-        
+        # Check if the session is still the active one
+        if session_id != scraping_status["session_id"]:
+            print(f"Session {session_id} is no longer active. Not starting scrape.")
+            return
+            
         visited = set()
-        scrape_page(start_url, start_url, visited, page_limit)
+        scrape_page(start_url, start_url, visited, page_limit, session_id)
         
-        # Mark scraping as complete
-        scraping_status["is_scraping"] = False
-        print(f"✅ Scraping complete: {len(visited)} pages scraped, {scraping_status['vectors_processed']} vectors processed")
+        # Mark scraping as complete if this is still the active session
+        if scraping_status["session_id"] == session_id:
+            scraping_status["is_scraping"] = False
+            print(f"✅ Scraping complete: {len(visited)} pages scraped, {scraping_status['vectors_processed']} vectors processed")
     
     except Exception as e:
-        scraping_status["is_scraping"] = False
-        scraping_status["error"] = str(e)
-        print(f"❌ Scraping error: {e}")
+        if scraping_status["session_id"] == session_id:
+            scraping_status["is_scraping"] = False
+            scraping_status["error"] = str(e)
+            print(f"❌ Scraping error: {e}")
 
 @app.route('/api/scrape', methods=['POST'])
 def start_scrape():
@@ -241,7 +268,7 @@ def start_scrape():
         return jsonify({"error": "URL is required"}), 400
     
     start_url = data['url']
-    page_limit = data.get('limit', 10)  # Default to 100 pages if not specified
+    page_limit = data.get('limit', 10)  # Default to 10 pages if not specified
     
     # Validate URL
     try:
@@ -264,6 +291,9 @@ def start_scrape():
             }
         }), 200
     
+    # Generate a new session ID
+    new_session_id = str(uuid.uuid4())
+    
     # Clear previous data if requested
     if data.get('clear_previous', False):
         try:
@@ -276,30 +306,50 @@ def start_scrape():
                 in_memory_vectors = []
                 print("Cleared in-memory vectors")
             
+            # Reset URLs found across all sessions too
+            scraping_status["urls_found"] = set()
             scraping_status["vectors_processed"] = 0
         except Exception as e:
             print(f"Error deleting vectors: {e}")
     
+    # Reset scraping status for this session
+    scraping_status["is_scraping"] = True
+    scraping_status["total_pages"] = page_limit
+    scraping_status["pages_scraped"] = 0
+    scraping_status["current_session_urls"] = set()  # Clear current session URLs
+    scraping_status["current_url"] = start_url
+    scraping_status["error"] = None
+    scraping_status["session_id"] = new_session_id
+    
     # Start scraping in a separate thread
-    threading.Thread(target=scrape_website_async, args=(start_url, page_limit), daemon=True).start()
+    threading.Thread(
+        target=scrape_website_async, 
+        args=(start_url, page_limit, new_session_id), 
+        daemon=True
+    ).start()
     
     # Return immediate response
     return jsonify({
         "status": "started",
-        "message": f"Started scraping {start_url} with a limit of {page_limit} pages"
+        "message": f"Started scraping {start_url} with a limit of {page_limit} pages",
+        "session_id": new_session_id
     }), 200
 
 @app.route('/api/scrape/status', methods=['GET'])
 def get_scrape_status():
     """Get the current status of the scraping process"""
+    # Option to include all URLs or just current session
+    include_all_urls = request.args.get('include_all_urls', 'false').lower() == 'true'
+    
     return jsonify({
         "is_scraping": scraping_status["is_scraping"],
         "total_pages": scraping_status["total_pages"],
         "pages_scraped": scraping_status["pages_scraped"],
-        "urls_found": list(scraping_status["urls_found"]),
+        "urls_found": list(scraping_status["urls_found"] if include_all_urls else scraping_status["current_session_urls"]),
         "vectors_processed": scraping_status["vectors_processed"],
         "current_url": scraping_status["current_url"],
-        "error": scraping_status["error"]
+        "error": scraping_status["error"],
+        "session_id": scraping_status["session_id"]
     }), 200
 
 @app.route('/api/scrape/cancel', methods=['POST'])
@@ -309,7 +359,8 @@ def cancel_scrape():
         scraping_status["is_scraping"] = False
         return jsonify({
             "status": "cancelled",
-            "message": "Scraping operation cancelled"
+            "message": "Scraping operation cancelled",
+            "session_id": scraping_status["session_id"]
         }), 200
     else:
         return jsonify({
@@ -321,22 +372,29 @@ def cancel_scrape():
 def search_content():
     query = request.args.get('query', '')
     limit = int(request.args.get('limit', 10))
+    session_filter = request.args.get('session_id', None)  # Optional filter by session
     
     if not query:
         return jsonify({"error": "Query parameter is required"}), 400
     
     try:
         # Generate embedding for the query
-        query_embedding = generate_simple_embedding(query)
+        query_embedding = generate_better_embedding(query)
         
         results = []
         
         try:
             if use_pinecone:
+                # Create filter if session_id provided
+                filter_dict = {}
+                if session_filter:
+                    filter_dict = {"session_id": {"$eq": session_filter}}
+                
                 search_results = index.query(
                     vector=query_embedding,
                     top_k=limit,
-                    include_metadata=True
+                    include_metadata=True,
+                    filter=filter_dict if filter_dict else None
                 )
                 
                 # Format results
@@ -345,19 +403,24 @@ def search_content():
                         "score": match.score,
                         "source_url": match.metadata.get("source_url"),
                         "tag": match.metadata.get("tag"),
-                        "text": match.metadata.get("text")
+                        "text": match.metadata.get("text"),
+                        "session_id": match.metadata.get("session_id")
                     })
             else:
                 # Fallback to in-memory search
-                # This is a simplified version that calculates cosine similarity
                 for vector in in_memory_vectors:
+                    # Skip if filtering by session and not matching
+                    if session_filter and vector["metadata"].get("session_id") != session_filter:
+                        continue
+                        
                     # Calculate dot product (simplified cosine similarity)
                     score = sum(a*b for a, b in zip(query_embedding, vector["values"]))
                     results.append({
                         "score": score,
                         "source_url": vector["metadata"]["source_url"],
                         "tag": vector["metadata"]["tag"],
-                        "text": vector["metadata"]["text"]
+                        "text": vector["metadata"]["text"],
+                        "session_id": vector["metadata"].get("session_id")
                     })
                 
                 # Sort by score in descending order and limit results
@@ -371,7 +434,8 @@ def search_content():
         return jsonify({
             "query": query,
             "count": len(results),
-            "results": results
+            "results": results,
+            "session_filter": session_filter
         }), 200
     
     except Exception as e:
@@ -384,18 +448,86 @@ def get_stats():
             # Get index stats
             stats = index.describe_index_stats()
             
+            # Get session breakdown if possible
+            session_counts = {}
+            if "session_id" in stats.namespaces:
+                session_counts = stats.namespaces["session_id"]
+            
             return jsonify({
                 "vector_count": stats.total_vector_count,
                 "dimension": stats.dimension,
-                "storage_type": "pinecone"
+                "storage_type": "pinecone",
+                "session_breakdown": session_counts
             }), 200
         else:
+            # Count vectors by session for in-memory storage
+            session_counts = {}
+            for vector in in_memory_vectors:
+                session_id = vector["metadata"].get("session_id", "unknown")
+                if session_id in session_counts:
+                    session_counts[session_id] += 1
+                else:
+                    session_counts[session_id] = 1
+            
             # Return in-memory stats
             return jsonify({
                 "vector_count": len(in_memory_vectors),
                 "dimension": DIMENSION,
-                "storage_type": "in-memory"
+                "storage_type": "in-memory",
+                "session_breakdown": session_counts
             }), 200
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/clear', methods=['POST'])
+def clear_data():
+    """Clear all data or data from a specific session"""
+    data = request.json or {}
+    session_id = data.get('session_id', None)
+    
+    try:
+        if use_pinecone:
+            if session_id:
+                # Delete only vectors from the specified session
+                filter_dict = {"session_id": {"$eq": session_id}}
+                index.delete(filter=filter_dict)
+                # Remove URLs from this session
+                if session_id in [url_session for url_session in scraping_status["urls_found"]]:
+                    scraping_status["urls_found"] = set(url for url in scraping_status["urls_found"] 
+                                                      if url not in scraping_status["current_session_urls"])
+                message = f"Cleared data for session {session_id}"
+            else:
+                # Delete all vectors
+                index.delete(delete_all=True)
+                # Clear all URLs
+                scraping_status["urls_found"] = set()
+                scraping_status["current_session_urls"] = set()
+                message = "Cleared all data"
+        else:
+            # In-memory storage
+            global in_memory_vectors
+            if session_id:
+                # Filter out vectors from the specified session
+                in_memory_vectors = [v for v in in_memory_vectors 
+                                    if v["metadata"].get("session_id") != session_id]
+                # Remove URLs from this session if it's the current one
+                if session_id == scraping_status["session_id"]:
+                    scraping_status["urls_found"] = set(url for url in scraping_status["urls_found"] 
+                                                      if url not in scraping_status["current_session_urls"])
+                message = f"Cleared data for session {session_id}"
+            else:
+                # Clear all vectors
+                in_memory_vectors = []
+                # Clear all URLs
+                scraping_status["urls_found"] = set()
+                scraping_status["current_session_urls"] = set()
+                message = "Cleared all data"
+        
+        return jsonify({
+            "status": "success",
+            "message": message
+        }), 200
     
     except Exception as e:
         return jsonify({"error": str(e)}), 500
