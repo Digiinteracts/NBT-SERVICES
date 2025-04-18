@@ -531,6 +531,47 @@ def clear_data():
     
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    
+    # Add this to your application startup code
+def check_pinecone_on_startup():
+    """Perform Pinecone connectivity check on startup"""
+    try:
+        print("======= PINECONE STARTUP DIAGNOSTIC =======")
+        print(f"Pinecone API Key provided: {bool(os.getenv('PINECONE_KEY'))}")
+        
+        if not os.getenv("PINECONE_KEY"):
+            print("WARNING: No Pinecone API key found in environment variables!")
+            return
+            
+        # Try to connect to Pinecone
+        print("Connecting to Pinecone...")
+        pc = Pinecone(api_key=os.getenv("PINECONE_KEY", ""))
+        
+        # List available indexes
+        try:
+            indexes = [index.name for index in pc.list_indexes()]
+            print(f"Available Pinecone indexes: {indexes}")
+            
+            if INDEX_NAME not in indexes:
+                print(f"WARNING: Required index '{INDEX_NAME}' not found!")
+            else:
+                print(f"Found required index: {INDEX_NAME}")
+                
+                # Test connection to the index
+                index = pc.Index(INDEX_NAME)
+                stats = index.describe_index_stats()
+                print(f"Index stats: {stats.total_vector_count} vectors, dimension={stats.dimension}")
+                print("Pinecone connection successful!")
+                
+        except Exception as e:
+            print(f"Error listing Pinecone indexes: {e}")
+            
+    except Exception as e:
+        print(f"Pinecone startup diagnostic failed: {e}")
+    
+    print("=========================================")
 
+# Call this function when your app starts
 if __name__ == "__main__":
+    check_pinecone_on_startup()
     app.run(debug=True, host='0.0.0.0', port=int(os.getenv("PORT", 8080)))
